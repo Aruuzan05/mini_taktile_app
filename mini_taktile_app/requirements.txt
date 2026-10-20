@@ -1,6 +1,0 @@
-streamlit>=1.50
-numpy
-scikit-learn
-pandas
-altair
-anthropic

@@ -161,13 +161,15 @@ SYSTEM_PROMPT = (
 # --------------------------------------------------------------------------
 # 3) AI AGENT: real LLM agent (tool-use loop), or the offline stand-in
 # --------------------------------------------------------------------------
-def run_llm_agent(app, audit, api_key=None):
+def run_llm_agent(app, audit, api_key=None, policy=None):
+    policy = policy or DEFAULT_POLICY
+    system = SYSTEM_PROMPT + " Treat these as red flags if they appear in the text: " + ", ".join(policy["red_flags"]) + "."
     import anthropic
     client = anthropic.Anthropic(api_key=api_key) if api_key else anthropic.Anthropic()
     messages = [{"role": "user", "content":
                  f"Application: {app['name']} asks for ${app['amount_k']}k. Purpose: {app['purpose']}."}]
     for _ in range(12):  # step limit: the agent cannot loop forever
-        resp = client.messages.create(model=MODEL_NAME, max_tokens=1024, system=SYSTEM_PROMPT,
+        resp = client.messages.create(model=MODEL_NAME, max_tokens=1024, system=system,
                                       tools=TOOLS, messages=messages)
         messages.append({"role": "assistant", "content": resp.content})
         results = []
@@ -175,10 +177,10 @@ def run_llm_agent(app, audit, api_key=None):
             if block.type != "tool_use":
                 continue
             if block.name == "submit_recommendation":
-                audit.append({"step": "agent_recommendation", **block.input})
+                _log(audit, "AI agent", "agent_recommendation", **block.input)
                 return block.input
             out = tool_impl(block.name, app)
-            audit.append({"step": "agent_tool_call", "tool": block.name, "result": out})
+            _log(audit, "AI agent", "agent_tool_call", tool=block.name, result=out)
             results.append({"type": "tool_result", "tool_use_id": block.id, "content": json.dumps(out)})
         if not results:
             break
@@ -189,69 +191,114 @@ def run_llm_agent(app, audit, api_key=None):
 
 RED_FLAG_WORDS = ["casino", "gambling", "overdraft", "lawsuit", "fraud", "bankrupt", "cash deposits"]
 
+# --------------------------------------------------------------------------
+# POLICY: everything a risk team can change without code (the "no-code" layer).
+# The Streamlit app edits a copy of this; the CLI uses it as is.
+# --------------------------------------------------------------------------
+FIELDS = {  # field name -> (label, how to read it from an application)
+    "amount_k": ("Loan amount ($k)", lambda a: a["amount_k"]),
+    "credit_score": ("Credit score", lambda a: a["bureau"]["credit_score"]),
+    "missed_payments_24m": ("Missed payments (24m)", lambda a: a["bureau"]["missed_payments_24m"]),
+    "monthly_revenue_k": ("Monthly revenue ($k)", lambda a: a["financials"]["monthly_revenue_k"]),
+    "debt_to_income_pct": ("Debt-to-income (%)", lambda a: round(a["financials"]["debt_to_income"] * 100)),
+    "years_in_business": ("Years in business", lambda a: a["financials"]["years_in_business"]),
+    "identity_verified": ("Identity verified (1 = yes)", lambda a: int(a["kyc"]["identity_verified"])),
+    "sanctions_hit": ("Sanctions hit (1 = yes)", lambda a: int(a["kyc"]["sanctions_hit"])),
+}
+OPS = {">": lambda x, v: x > v, ">=": lambda x, v: x >= v, "<": lambda x, v: x < v,
+       "<=": lambda x, v: x <= v, "=": lambda x, v: x == v}
 
-def run_offline_agent(app, audit):
+DEFAULT_POLICY = {
+    "rules": [  # evaluated top to bottom; DECLINE stops the flow, HUMAN REVIEW flags the case
+        {"active": True, "name": "Product limit", "field": "amount_k", "op": ">", "value": 250, "then": "DECLINE"},
+        {"active": True, "name": "Identity check", "field": "identity_verified", "op": "=", "value": 0, "then": "DECLINE"},
+        {"active": True, "name": "Sanctions screening", "field": "sanctions_hit", "op": "=", "value": 1, "then": "DECLINE"},
+        {"active": False, "name": "Repeated missed payments", "field": "missed_payments_24m", "op": ">=", "value": 3,
+         "then": "HUMAN REVIEW"},
+    ],
+    "approve_at": 0.75,         # model score at or above -> agent may approve
+    "decline_at": 0.40,         # model score at or below -> agent declines
+    "min_confidence": 0.60,     # guardrail: below this the case goes to a human
+    "red_flags": list(RED_FLAG_WORDS),
+}
+
+
+def _log(audit, layer, step, **kw):
+    audit.append({"t": datetime.now().astimezone().isoformat(timespec="milliseconds"), "layer": layer,
+                  "step": step, **kw})
+
+
+def evaluate_rules(app, policy):
+    """Return (blocking_rule or None, list of HUMAN REVIEW rules hit, list of all checks)."""
+    checks, review_hits = [], []
+    for r in policy["rules"]:
+        if not r.get("active", True) or r.get("field") not in FIELDS or r.get("op") not in OPS:
+            continue
+        x = FIELDS[r["field"]][1](app)
+        hit = OPS[r["op"]](x, float(r["value"]))
+        checks.append({"rule": r["name"], "condition": f"{r['field']} {r['op']} {float(r['value']):g}", "actual": x,
+                       "hit": bool(hit), "then": r["then"] if hit else "pass"})
+        if hit and r["then"] == "DECLINE":
+            return r, review_hits, checks
+        if hit and r["then"] == "HUMAN REVIEW":
+            review_hits.append(r)
+    return None, review_hits, checks
+
+
+def run_offline_agent(app, audit, policy=DEFAULT_POLICY):
     """Same steps as the LLM agent, with keyword checks instead of a language model."""
     ev = {}
     for name in ["get_credit_report", "get_financials", "get_bank_transaction_notes",
                  "check_kyc", "search_news", "get_risk_model_score"]:
         ev[name] = tool_impl(name, app)
-        audit.append({"step": "agent_tool_call", "tool": name, "result": ev[name]})
+        _log(audit, "AI agent", "agent_tool_call", tool=name, result=ev[name])
     text = (ev["get_bank_transaction_notes"]["notes"] + " " + ev["search_news"]["results"]).lower()
-    flags = [f"Text mentions '{w}'" for w in RED_FLAG_WORDS if w in text]
+    flags = [f"Text mentions '{w}'" for w in policy["red_flags"] if w and w.lower() in text]
     p = ev["get_risk_model_score"]["p_repay"]
     reasons = [f"Risk model: {p:.0%} chance of repayment ({', '.join(ev['get_risk_model_score']['top_drivers'])})"]
-    if p <= 0.40:
+    if p <= policy["decline_at"]:
         decision, conf = "DECLINE", 1 - p
         reasons.append("Low score" + (", and the notes confirm the risk" if flags else "; notes do not change the picture"))
     elif flags:
         decision, conf = "HUMAN REVIEW", 0.5
         reasons.append("Bank notes or news contain a red flag the model cannot see")
-    elif p >= 0.75:
+    elif p >= policy["approve_at"]:
         decision, conf = "APPROVE", p
         reasons.append("Strong score and no red flags in notes or news")
     else:
         decision, conf = "HUMAN REVIEW", 0.5
         reasons.append("Middle score: not confident enough to decide alone")
     rec = {"decision": decision, "confidence": round(conf, 2), "reasons": reasons, "red_flags": flags}
-    audit.append({"step": "agent_recommendation", **rec})
+    _log(audit, "AI agent", "agent_recommendation", **rec)
     return rec
 
 
 # --------------------------------------------------------------------------
-# 4) RULES: hard limits, checked by the platform, never by the agent
+# ORCHESTRATOR: rules first, then agent, then guardrails -> human queue
 # --------------------------------------------------------------------------
-def hard_rules(app):
-    if app["amount_k"] > 250:
-        return "Amount above the bank's $250k limit for this product"
-    if not app["kyc"]["identity_verified"]:
-        return "Identity check failed"
-    if app["kyc"]["sanctions_hit"]:
-        return "Sanctions screening hit"
-    return None
+def decide(app_id, use_llm, api_key=None, policy=None):
+    return decide_app(APPLICANTS[app_id], use_llm, api_key, policy)
 
 
-# --------------------------------------------------------------------------
-# 5) ORCHESTRATOR: rules first, then agent, then guardrails -> human queue
-# --------------------------------------------------------------------------
-def decide(app_id, use_llm, api_key=None):
-    return decide_app(APPLICANTS[app_id], use_llm, api_key)
+def decide_app(app, use_llm, api_key=None, policy=None, version="v1"):
+    """Run one application through rules, agent and guardrails under a given policy."""
+    policy = policy or DEFAULT_POLICY
+    audit = []
+    _log(audit, "Intake", "received", applicant=app["name"], amount_k=app["amount_k"], policy_version=version)
 
+    block, review_hits, checks = evaluate_rules(app, policy)
+    _log(audit, "Rules", "rules_evaluated", checks=checks)
+    if block:
+        why = [f"Rule \u201c{block['name']}\u201d: {block['field']} {block['op']} {float(block['value']):g}"]
+        _log(audit, "Decision", "final", decision="DECLINE", decided_by="hard rules", reasons=why)
+        return {"final": "DECLINE", "by": "rules", "why": why, "rule_checks": checks,
+                "policy_version": version}, audit
 
-def decide_app(app, use_llm, api_key=None):
-    """Run one application (a dict shaped like APPLICANTS[...]) through all 5 layers."""
-    audit = [{"step": "received", "applicant": app["name"], "amount_k": app["amount_k"],
-              "time": datetime.now(timezone.utc).isoformat(timespec="seconds")}]
+    if use_llm:
+        agent = run_llm_agent(app, audit, api_key, policy)
+    else:
+        agent = run_offline_agent(app, audit, policy)
 
-    broken = hard_rules(app)
-    if broken:
-        audit.append({"step": "rule_block", "rule": broken})
-        audit.append({"step": "final", "decision": "DECLINE", "decided_by": "hard rules"})
-        return {"final": "DECLINE", "by": "rules", "why": [broken]}, audit
-
-    agent = run_llm_agent(app, audit, api_key) if use_llm else run_offline_agent(app, audit)
-
-    # Guardrails: when do we NOT trust the agent on its own?
     score = ml_score(app)["p_repay"]
     final, why = agent["decision"], list(agent["reasons"])
     n_before = len(why)
@@ -259,15 +306,24 @@ def decide_app(app, use_llm, api_key=None):
         final, why = "HUMAN REVIEW", why + [f"Guardrail: agent approves but model score is only {score:.0%}"]
     if agent["decision"] == "DECLINE" and score > 0.8:
         final, why = "HUMAN REVIEW", why + [f"Guardrail: agent declines but model score is {score:.0%}"]
-    if agent.get("confidence", 0) < 0.6 and final != "HUMAN REVIEW":
-        final, why = "HUMAN REVIEW", why + ["Guardrail: agent confidence below 60%"]
+    if agent.get("confidence", 0) < policy["min_confidence"] and final != "HUMAN REVIEW":
+        final, why = "HUMAN REVIEW", why + [f"Guardrail: agent confidence below {policy['min_confidence']:.0%}"]
+    for r in review_hits:
+        if final != "HUMAN REVIEW" or not any(r["name"] in w for w in why):
+            final = "HUMAN REVIEW"
+            why = why + [f"Rule \u201c{r['name']}\u201d sends the case to a human"]
+    guard = why[n_before:]
+    if guard:
+        _log(audit, "Guardrails", "guardrails_triggered", triggered=guard)
+    else:
+        _log(audit, "Guardrails", "guardrails_passed")
 
-    audit.append({"step": "final", "decision": final,
-                  "decided_by": "human review queue" if final == "HUMAN REVIEW" else "agent + guardrails"})
-    return {"final": final, "by": "agent" if final != "HUMAN REVIEW" else "sent to human",
-            "why": why, "red_flags": agent.get("red_flags", []), "model_score": score,
+    by = "agent" if final != "HUMAN REVIEW" else "sent to human"
+    _log(audit, "Decision", "final", decision=final,
+         decided_by="human review queue" if final == "HUMAN REVIEW" else "agent + guardrails", reasons=why)
+    return {"final": final, "by": by, "why": why, "red_flags": agent.get("red_flags", []), "model_score": score,
             "agent_decision": agent["decision"], "agent_confidence": agent.get("confidence", 0),
-            "guardrails": why[n_before:]}, audit
+            "guardrails": guard, "rule_checks": checks, "policy_version": version}, audit
 
 
 def main():
